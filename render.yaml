@@ -11,5 +11,7 @@ services:
         value: production
       - key: CHROMA_PATH
         value: /opt/render/project/src/chroma_db
+      - key: ANONYMIZED_TELEMETRY
+        value: "False"
       - key: ANTHROPIC_API_KEY
         sync: false
