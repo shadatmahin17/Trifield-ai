@@ -1,30 +1,56 @@
+import json
+import os
 import uuid
+from functools import lru_cache
+from typing import Any
+
 import anthropic
-import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+
 from core.config import get_settings
+
+# Keep Chroma/ONNX telemetry quiet in hosted environments and set this before
+# any Chroma client is created. Render should be able to bind the web port
+# before expensive PDF/vector-store work starts.
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
 # In-memory chat history per session  {session_id: [{"role":..,"content":..}]}
 _chat_history: dict[str, list[dict]] = {}
 
-# ChromaDB client (persisted to disk)
-_settings = get_settings()
-_chroma_client = chromadb.PersistentClient(path=_settings.chroma_path)
-_embed_fn = SentenceTransformerEmbeddingFunction(
-    model_name="all-MiniLM-L6-v2"   # free, runs locally, ~80MB download on first run
-)
+
+@lru_cache(maxsize=1)
+def _get_chroma_client() -> Any:
+    """Create the ChromaDB client lazily, not while FastAPI imports the app."""
+    import chromadb
+
+    settings = get_settings()
+    return chromadb.PersistentClient(path=settings.chroma_path)
+
+
+@lru_cache(maxsize=1)
+def _get_embedding_function() -> Any:
+    """Load the local embedding model only when a PDF workflow needs it."""
+    from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+
+    return SentenceTransformerEmbeddingFunction(
+        model_name="all-MiniLM-L6-v2"  # free, runs locally, ~80MB download on first use
+    )
 
 
 def _get_or_create_collection(session_id: str):
-    return _chroma_client.get_or_create_collection(
+    return _get_chroma_client().get_or_create_collection(
         name=f"pdf_{session_id}",
-        embedding_function=_embed_fn,
+        embedding_function=_get_embedding_function(),
     )
+
+
+def _get_anthropic_client() -> anthropic.Anthropic:
+    settings = get_settings()
+    return anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
 
 def _chunk_text(text: str, chunk_size: int = 600, overlap: int = 100) -> list[str]:
     """Split text into overlapping chunks for RAG."""
-    words  = text.split()
+    words = text.split()
     chunks = []
     i = 0
     while i < len(words):
@@ -56,6 +82,9 @@ async def ingest_pdf(file_bytes: bytes, filename: str) -> str:
     full_text = "\n".join(p["text"] for p in pages_text)
     chunks = _chunk_text(full_text)
 
+    if not chunks:
+        raise ValueError("The uploaded PDF did not contain extractable text.")
+
     # Store chunks in ChromaDB
     col = _get_or_create_collection(session_id)
     col.add(
@@ -80,7 +109,7 @@ async def chat_with_pdf(session_id: str, question: str) -> dict:
     # 1. Retrieve top-5 relevant chunks
     col = _get_or_create_collection(session_id)
     results = col.query(query_texts=[question], n_results=5)
-    docs     = results["documents"][0]
+    docs = results["documents"][0]
     metadatas = results["metadatas"][0]
 
     context = "\n\n---\n\n".join(docs)
@@ -101,7 +130,7 @@ async def chat_with_pdf(session_id: str, question: str) -> dict:
     messages = history + [{"role": "user", "content": question}]
 
     # 3. Call Claude API
-    client = anthropic.Anthropic(api_key=_settings.anthropic_api_key)
+    client = _get_anthropic_client()
     response = client.messages.create(
         model="claude-haiku-4-5",   # cheapest model — great for Q&A
         max_tokens=1024,
@@ -111,17 +140,17 @@ async def chat_with_pdf(session_id: str, question: str) -> dict:
     answer = response.content[0].text
 
     # 4. Update history
-    _chat_history[session_id].append({"role": "user",      "content": question})
+    _chat_history[session_id].append({"role": "user", "content": question})
     _chat_history[session_id].append({"role": "assistant", "content": answer})
 
     return {
-        "answer":  answer,
+        "answer": answer,
         "sources": sources,
         "history": _chat_history[session_id],
     }
 
 
-async def extract_properties(session_id: str) -> list[dict]:
+async def extract_properties(session_id: str) -> list[dict[str, Any]]:
     """
     Ask Claude to extract a structured table of material/mechanical properties
     from the ingested PDF chunks.
@@ -149,14 +178,13 @@ async def extract_properties(session_id: str) -> list[dict]:
         "Return ONLY the JSON array, no markdown, no explanation."
     )
 
-    client = anthropic.Anthropic(api_key=_settings.anthropic_api_key)
+    client = _get_anthropic_client()
     response = client.messages.create(
         model="claude-haiku-4-5",
         max_tokens=2048,
         messages=[{"role": "user", "content": prompt}],
     )
 
-    import json
     raw = response.content[0].text.strip()
     # Strip markdown fences if present
     raw = raw.replace("```json", "").replace("```", "").strip()
