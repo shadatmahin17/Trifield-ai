@@ -6,18 +6,20 @@ router = APIRouter()
 
 @router.get("/", response_model=SearchResponse)
 async def search(
-    query:      str = Query(..., description="Search query e.g. 'carbon fibre composite fatigue'"),
+    query:      str = Query(..., description="e.g. 'carbon fibre composite fatigue'"),
     discipline: str = Query("all", description="all | aerospace | materials | textile"),
     year_from:  int = Query(None, description="Filter from year e.g. 2015"),
     year_to:    int = Query(None, description="Filter to year e.g. 2024"),
-    limit:      int = Query(10,   description="Number of results (max 50)", le=50, ge=1),
+    limit:      int = Query(10, description="Number of results (max 50)", le=50, ge=1),
 ):
     """
-    Search research papers via Semantic Scholar.
-    Works directly in browser — no API key needed.
+    Search research papers via Semantic Scholar (free, no API key needed).
+    Results are cached for 1 hour — repeated queries are instant.
 
-    Example:
-      GET /api/search/?query=jute+flax+hybrid+composite&discipline=textile&limit=5
+    Examples:
+      /api/search/?query=jute+flax+hybrid+composite&discipline=textile
+      /api/search/?query=carbon+fibre+laminate+fatigue&discipline=aerospace&limit=5
+      /api/search/?query=3D+woven+composites+damage&discipline=materials&year_from=2018
     """
     try:
         papers = await search_papers(
@@ -34,4 +36,12 @@ async def search(
             papers=papers,
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        msg = str(e)
+        # Give friendly message for rate limit
+        if "rate limit" in msg.lower() or "429" in msg:
+            raise HTTPException(
+                status_code=429,
+                detail="Semantic Scholar rate limit reached. Wait 30 seconds and try again. "
+                       "Tip: repeated searches are cached and never hit the rate limit."
+            )
+        raise HTTPException(status_code=500, detail=msg)
