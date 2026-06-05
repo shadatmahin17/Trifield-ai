@@ -17,18 +17,31 @@ DISCIPLINE_KEYWORDS = {
         "carbon fibre", "carbon fiber", "airframe", "aerostructure",
         "damage tolerance", "composite laminate", "sandwich panel",
         "aeroelastic", "fuselage", "wing structure", "fatigue crack",
+        "structural health monitoring", "composite structure",
     ],
     "materials": [
         "composite", "hybrid composite", "nanocomposite", "polymer matrix",
         "epoxy", "fibre reinforced", "fiber reinforced", "tensile strength",
         "flexural strength", "void content", "fibre volume fraction",
         "delamination", "fracture toughness", "matrix cracking", "interlaminar",
+        "mechanical properties", "impact resistance",
     ],
     "textile": [
-        "textile", "woven fabric", "weave", "yarn", "braided", "knitted",
-        "nonwoven", "jute", "flax", "hemp", "natural fibre", "natural fiber",
-        "technical textile", "preform", "fabric structure", "spinning", "dyeing",
+        "textile composite", "woven composite", "woven fabric composite",
+        "natural fibre composite", "natural fiber composite",
+        "jute composite", "flax composite", "hemp composite",
+        "hybrid composite", "bast fibre", "bast fiber",
+        "fabric reinforced", "preform", "woven reinforcement",
+        "technical textile", "braided composite",
     ],
+}
+
+# Minimum keyword hits required for a paper to pass discipline filter
+DISCIPLINE_MIN_SCORE = {
+    "aerospace": 1,
+    "materials": 1,
+    "textile":   2,   # stricter — textile has more noise
+    "all":       0,
 }
 
 DISCIPLINE_CONCEPTS = {
@@ -42,6 +55,17 @@ EXCLUDE_CONCEPTS = {
     "C144024400",  # Medicine
     "C185592680",  # Pure chemistry
 }
+
+# Junk result patterns — filter out standards docs, patents, etc.
+JUNK_TITLE_PATTERNS = [
+    r"^specification for",
+    r"^standard for",
+    r"^iso \d+",
+    r"^bs \d+",
+    r"^astm [a-z]",
+    r"twines made from",
+    r"^patent",
+]
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -69,6 +93,26 @@ def _is_excluded(concepts: list) -> bool:
     return bool(ids & EXCLUDE_CONCEPTS)
 
 
+def _is_junk(paper: dict) -> bool:
+    """Filter out standards, specs, patents, and papers with no useful metadata."""
+    title = (paper.get("title") or "").lower().strip()
+
+    # No title or no year and no authors = useless
+    if not title:
+        return True
+    has_authors = bool(paper.get("authors"))
+    has_year    = bool(paper.get("year"))
+    if not has_authors and not has_year:
+        return True
+
+    # Match junk title patterns
+    for pat in JUNK_TITLE_PATTERNS:
+        if re.match(pat, title, re.IGNORECASE):
+            return True
+
+    return False
+
+
 def _reconstruct_abstract(inv: dict | None) -> str | None:
     if not inv:
         return None
@@ -90,7 +134,7 @@ def _clean_abstract(text: str | None) -> str | None:
 
 
 def _norm_title(t: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", t.lower())[:80]
+    return re.sub(r"[^a-z0-9]", "", (t or "").lower())[:80]
 
 
 def _cache_key(*args) -> str:
@@ -104,6 +148,85 @@ def _get_cached(key):
 
 def _set_cache(key, papers):
     _cache[key] = {"papers": papers, "expires": time.time() + CACHE_TTL}
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ABSTRACT ENRICHMENT — Crossref direct DOI lookup
+# ══════════════════════════════════════════════════════════════════
+
+async def _fetch_abstract_by_doi(doi: str, client: httpx.AsyncClient) -> str | None:
+    """
+    Direct Crossref DOI lookup for abstract.
+    Works for papers where the search endpoint omits the abstract field.
+    """
+    if not doi:
+        return None
+    doi_clean = doi.replace("https://doi.org/", "").strip()
+    try:
+        resp = await client.get(
+            f"https://api.crossref.org/works/{doi_clean}",
+            timeout=8,
+            headers={"User-Agent": "TriFieldAI/1.0 (contact@trifield.ai)"}
+        )
+        if resp.status_code == 200:
+            abstract = resp.json().get("message", {}).get("abstract", "")
+            return _clean_abstract(abstract)
+    except Exception:
+        pass
+    return None
+
+
+async def _get_oa_url(doi: str, client: httpx.AsyncClient) -> str | None:
+    """Unpaywall: find best free PDF for a DOI."""
+    if not doi:
+        return None
+    doi_clean = doi.replace("https://doi.org/", "").strip()
+    try:
+        resp = await client.get(
+            f"https://api.unpaywall.org/v2/{doi_clean}?email=contact@trifield.ai",
+            timeout=6
+        )
+        if resp.status_code == 200:
+            best = resp.json().get("best_oa_location") or {}
+            return best.get("url_for_pdf") or best.get("url")
+    except Exception:
+        pass
+    return None
+
+
+async def _enrich(paper: dict, client: httpx.AsyncClient) -> dict:
+    """
+    For papers missing abstract or OA url, fetch both concurrently.
+    Returns updated paper dict.
+    """
+    doi      = paper.get("doi") or ""
+    abstract = paper.get("abstract")
+    oa_url   = paper.get("open_access_url")
+
+    tasks = []
+    need_abstract = not abstract and doi
+    need_oa       = not oa_url and doi
+
+    if need_abstract and need_oa:
+        abstract_new, oa_new = await asyncio.gather(
+            _fetch_abstract_by_doi(doi, client),
+            _get_oa_url(doi, client),
+        )
+    elif need_abstract:
+        abstract_new = await _fetch_abstract_by_doi(doi, client)
+        oa_new = None
+    elif need_oa:
+        abstract_new = None
+        oa_new = await _get_oa_url(doi, client)
+    else:
+        return paper  # nothing to enrich
+
+    if abstract_new:
+        paper["abstract"] = abstract_new
+    if oa_new:
+        paper["open_access_url"] = oa_new
+
+    return paper
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -182,17 +305,16 @@ async def _search_crossref(
     params = {
         "query":  query,
         "rows":   min(limit * 2, 40),
-        "select": "DOI,title,author,published,abstract,container-title,is-referenced-by-count",
+        "select": "DOI,title,author,published,abstract,container-title,is-referenced-by-count,type",
         "sort":   "relevance",
         "mailto": "contact@trifield.ai",
+        # Only journal articles and conference papers — excludes standards
+        "filter": "type:journal-article,type:proceedings-article",
     }
-    year_filter_parts = []
     if year_from:
-        year_filter_parts.append(f"from-pub-date:{year_from}")
+        params["filter"] += f",from-pub-date:{year_from}"
     if year_to:
-        year_filter_parts.append(f"until-pub-date:{year_to}")
-    if year_filter_parts:
-        params["filter"] = ",".join(year_filter_parts)
+        params["filter"] += f",until-pub-date:{year_to}"
 
     try:
         resp = await client.get(
@@ -203,9 +325,9 @@ async def _search_crossref(
             return []
         papers = []
         for item in resp.json().get("message", {}).get("items", []):
-            doi         = item.get("DOI") or ""
-            title_list  = item.get("title") or []
-            title       = title_list[0] if title_list else ""
+            doi        = item.get("DOI") or ""
+            title_list = item.get("title") or []
+            title      = title_list[0] if title_list else ""
             if not title:
                 continue
             authors = [
@@ -256,17 +378,17 @@ async def _search_arxiv(
     if cat:
         search_query = f"({search_query}) AND ({cat})"
 
-    params = {
-        "search_query": search_query,
-        "start":        0,
-        "max_results":  min(limit, 20),
-        "sortBy":       "relevance",
-        "sortOrder":    "descending",
-    }
-
     try:
         resp = await client.get(
-            "https://export.arxiv.org/api/query", params=params, timeout=15
+            "https://export.arxiv.org/api/query",
+            params={
+                "search_query": search_query,
+                "start":        0,
+                "max_results":  min(limit, 15),
+                "sortBy":       "relevance",
+                "sortOrder":    "descending",
+            },
+            timeout=15
         )
         if resp.status_code != 200:
             return []
@@ -328,7 +450,7 @@ async def _search_pubmed(
     client: httpx.AsyncClient
 ) -> list[dict]:
     if discipline == "aerospace":
-        return []   # PubMed not relevant for pure aerospace
+        return []
 
     search_params = {
         "db":      "pubmed",
@@ -371,7 +493,6 @@ async def _search_pubmed(
 
         root   = ET.fromstring(fetch_resp.text)
         papers = []
-
         for article in root.findall(".//PubmedArticle"):
             medline = article.find("MedlineCitation")
             if medline is None:
@@ -391,7 +512,7 @@ async def _search_pubmed(
             pub_date = art.find(".//PubDate")
             year     = None
             if pub_date is not None:
-                yr = pub_date.findtext("Year")
+                yr   = pub_date.findtext("Year")
                 year = int(yr) if yr and yr.isdigit() else None
 
             authors = []
@@ -431,45 +552,21 @@ async def _search_pubmed(
 
 
 # ══════════════════════════════════════════════════════════════════
-#  SOURCE 5 — Unpaywall (OA enrichment only)
-# ══════════════════════════════════════════════════════════════════
-
-async def _get_oa_url(doi: str, client: httpx.AsyncClient) -> str | None:
-    if not doi:
-        return None
-    doi_clean = doi.replace("https://doi.org/", "").strip()
-    try:
-        resp = await client.get(
-            f"https://api.unpaywall.org/v2/{doi_clean}?email=contact@trifield.ai",
-            timeout=6
-        )
-        if resp.status_code == 200:
-            best = resp.json().get("best_oa_location") or {}
-            return best.get("url_for_pdf") or best.get("url")
-    except Exception:
-        pass
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════
 #  MERGE + DEDUPLICATE
 # ══════════════════════════════════════════════════════════════════
 
 def _deduplicate(papers: list[dict]) -> list[dict]:
-    seen_dois:   set[str] = set()
-    seen_titles: set[str] = set()
-    by_key:      dict[str, dict] = {}
+    by_key: dict[str, dict] = {}
 
     for p in papers:
-        doi   = (p.get("doi") or "").strip()
+        doi    = (p.get("doi") or "").strip()
         ntitle = _norm_title(p.get("title") or "")
+        key    = doi if doi else ntitle
+        if not key:
+            continue
 
-        match_key = doi if doi and doi in by_key else \
-                    ntitle if ntitle in by_key else None
-
-        if match_key:
-            existing = by_key[match_key]
-            # Merge best fields
+        if key in by_key:
+            existing = by_key[key]
             if not existing.get("abstract") and p.get("abstract"):
                 existing["abstract"] = p["abstract"]
             if not existing.get("open_access_url") and p.get("open_access_url"):
@@ -479,24 +576,19 @@ def _deduplicate(papers: list[dict]) -> list[dict]:
             if p["source"] in ("crossref", "pubmed") and p.get("journal"):
                 existing["journal"] = p["journal"]
         else:
-            if doi:
-                by_key[doi]    = p
-                seen_dois.add(doi)
-            if ntitle:
+            by_key[key] = p
+            # Also index by title to catch DOI mismatches
+            if ntitle and ntitle not in by_key:
                 by_key[ntitle] = p
-                seen_titles.add(ntitle)
 
-    # Return unique papers in original order
     seen:   set[str] = set()
     result: list[dict] = []
     for p in papers:
         ntitle = _norm_title(p.get("title") or "")
-        if ntitle not in seen:
+        if ntitle and ntitle not in seen:
             seen.add(ntitle)
-            # Return the merged version from by_key
             doi = (p.get("doi") or "").strip()
-            merged = by_key.get(doi) or by_key.get(ntitle) or p
-            result.append(merged)
+            result.append(by_key.get(doi) or by_key.get(ntitle) or p)
     return result
 
 
@@ -528,66 +620,73 @@ async def search_papers(
             return_exceptions=True
         )
 
-        # Flatten — skip any source that threw an exception
+        # Flatten — skip errored sources
         all_raw: list[dict] = []
         for r in results:
             if isinstance(r, list):
                 all_raw.extend(r)
 
-        # 3. Deduplicate
+        # 3. Remove junk results first
+        all_raw = [p for p in all_raw if not _is_junk(p)]
+
+        # 4. Deduplicate across sources
         merged = _deduplicate(all_raw)
 
-        # 4. Filter irrelevant papers
+        # 5. Filter by discipline relevance
+        min_score = DISCIPLINE_MIN_SCORE.get(discipline, 1)
         relevant: list[dict] = []
         for p in merged:
             if _is_excluded(p.get("concepts") or []):
                 continue
-            if _score(p.get("title",""), p.get("abstract"), discipline) < 1:
-                continue
-            relevant.append(p)
+            if _score(p.get("title", ""), p.get("abstract"), discipline) >= min_score:
+                relevant.append(p)
 
-        # 5. Sort: discipline match first, then citation count descending
+        # 6. Sort: discipline match first, then citation count desc
         relevant.sort(key=lambda p: (
-            0 if _tag_discipline(
-                p.get("title",""), p.get("abstract"), p.get("concepts",[])
-            ) == discipline or discipline == "all" else 1,
+            0 if (discipline == "all" or _tag_discipline(
+                p.get("title", ""), p.get("abstract"), p.get("concepts", [])
+            ) == discipline) else 1,
             -(p.get("citation_count") or 0)
         ))
 
-        # 6. Take top N and enrich missing OA urls via Unpaywall
-        top = relevant[:limit]
-
-        async def _maybe_get_oa(p: dict) -> str | None:
-            if p.get("open_access_url"):
-                return p["open_access_url"]
-            return await _get_oa_url(p.get("doi",""), client)
-
-        oa_urls = await asyncio.gather(
-            *[_maybe_get_oa(p) for p in top],
+        # 7. Take top N × 2 candidates, enrich abstracts + OA urls concurrently
+        candidates = relevant[:limit * 2]
+        enriched = await asyncio.gather(
+            *[_enrich(p, client) for p in candidates],
             return_exceptions=True
         )
 
-    # 7. Build final Paper objects
+        # Replace with enriched versions (skip any that errored)
+        final_candidates = []
+        for orig, result in zip(candidates, enriched):
+            final_candidates.append(result if isinstance(result, dict) else orig)
+
+        # 8. Final relevance re-score after enrichment (abstracts now available)
+        #    and take final top N
+        final_candidates.sort(key=lambda p: (
+            0 if (discipline == "all" or _tag_discipline(
+                p.get("title", ""), p.get("abstract"), p.get("concepts", [])
+            ) == discipline) else 1,
+            -(p.get("citation_count") or 0)
+        ))
+        top = final_candidates[:limit]
+
+    # 9. Build Paper objects
     papers: list[Paper] = []
-    for p, oa_url in zip(top, oa_urls):
-        final_oa = (p.get("open_access_url") or
-                    (oa_url if isinstance(oa_url, str) else None))
+    for p in top:
         abstract = p.get("abstract")
         concepts = p.get("concepts") or []
-
         papers.append(Paper(
             paper_id        = p["paper_id"],
-            title           = p["title"] or "Untitled",
+            title           = p.get("title") or "Untitled",
             authors         = p.get("authors") or [],
             year            = p.get("year"),
             abstract        = abstract,
             citation_count  = p.get("citation_count") or 0,
             url             = p.get("url") or "",
-            open_access_url = final_oa,
+            open_access_url = p.get("open_access_url"),
             journal         = p.get("journal"),
-            discipline_tag  = _tag_discipline(
-                p.get("title",""), abstract, concepts
-            ),
+            discipline_tag  = _tag_discipline(p.get("title", ""), abstract, concepts),
         ))
 
     _set_cache(key, papers)
