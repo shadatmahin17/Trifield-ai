@@ -1,53 +1,77 @@
-from fastapi import APIRouter, File, HTTPException, UploadFile
-
-from core.config import get_settings
+from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+from services.pdf_service import ingest_pdf, chat_with_pdf, extract_properties
 from models.schemas import ChatRequest, ChatResponse, PropertyExtractionResponse
-from services.pdf_service import chat_with_pdf, extract_properties, ingest_pdf
 
 router = APIRouter()
 
-
 @router.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)) -> dict[str, str]:
-    if file.content_type not in {"application/pdf", "application/octet-stream"}:
-        raise HTTPException(status_code=400, detail="Only PDF uploads are supported.")
+async def upload_pdf(file: UploadFile = File(...)):
+    """
+    Upload a PDF. Returns a session_id to use for chat and property extraction.
 
-    settings = get_settings()
-    file_bytes = await file.read()
-    max_bytes = settings.max_pdf_size_mb * 1024 * 1024
-    if len(file_bytes) > max_bytes:
-        raise HTTPException(
-            status_code=413,
-            detail=f"PDF is too large. Maximum size is {settings.max_pdf_size_mb} MB.",
-        )
+    - Max size: 20MB
+    - Supported: any research paper PDF
+    """
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    contents = await file.read()
+    size_mb = len(contents) / (1024 * 1024)
+    if size_mb > 20:
+        raise HTTPException(status_code=400, detail=f"File too large ({size_mb:.1f}MB). Max is 20MB.")
 
     try:
-        session_id = await ingest_pdf(file_bytes, file.filename or "uploaded.pdf")
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"PDF ingestion failed: {exc}") from exc
-
-    return {"session_id": session_id}
+        session_id = await ingest_pdf(contents, file.filename)
+        return {
+            "session_id": session_id,
+            "filename":   file.filename,
+            "size_mb":    round(size_mb, 2),
+            "message":    "PDF uploaded and indexed successfully. Use session_id to chat.",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest) -> ChatResponse:
+async def chat(req: ChatRequest):
+    """
+    Ask a question about an uploaded PDF.
+    Requires session_id from /api/pdf/upload.
+
+    Body:
+      { "session_id": "...", "question": "What fibre volume fraction was used?" }
+    """
     try:
-        result = await chat_with_pdf(request.session_id, request.question)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"PDF chat failed: {exc}") from exc
+        result = await chat_with_pdf(req.session_id, req.question)
+        return ChatResponse(
+            session_id=req.session_id,
+            answer=result["answer"],
+            sources=result["sources"],
+            history=result["history"],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return ChatResponse(session_id=request.session_id, **result)
 
+@router.get("/extract-properties/{session_id}", response_model=PropertyExtractionResponse)
+async def extract(session_id: str):
+    """
+    Auto-extract mechanical/material properties from an uploaded PDF.
+    Returns a structured table: property name, value, unit, test standard.
 
-@router.get("/{session_id}/properties", response_model=PropertyExtractionResponse)
-async def properties(session_id: str) -> PropertyExtractionResponse:
+    Example:
+      GET /api/pdf/extract-properties/your-session-id
+    """
     try:
-        properties_data = await extract_properties(session_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Property extraction failed: {exc}") from exc
-
-    return PropertyExtractionResponse(session_id=session_id, properties=properties_data)
+        properties = await extract_properties(session_id)
+        return PropertyExtractionResponse(
+            session_id=session_id,
+            properties=properties,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
