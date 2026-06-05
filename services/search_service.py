@@ -154,13 +154,59 @@ def _set_cache(key, papers):
 #  ABSTRACT ENRICHMENT — Crossref direct DOI lookup
 # ══════════════════════════════════════════════════════════════════
 
-async def _fetch_abstract_by_doi(doi: str, client: httpx.AsyncClient) -> str | None:
+async def _fetch_abstract_crossref(doi: str, client: httpx.AsyncClient) -> str | None:
+    """Direct Crossref DOI lookup for abstract."""
+    if not doi:
+        return None
+    doi_clean = doi.replace("https://doi.org/", "").strip()
+    try:
+        resp = await client.get(
+            f"https://api.crossref.org/works/{doi_clean}",
+            timeout=8,
+            headers={"User-Agent": "TriFieldAI/1.0 (contact@trifield.ai)"}
+        )
+        if resp.status_code == 200:
+            abstract = resp.json().get("message", {}).get("abstract", "")
+            return _clean_abstract(abstract)
+    except Exception:
+        pass
+    return None
+
+
+async def _fetch_abstract_s2(doi: str, client: httpx.AsyncClient) -> str | None:
     """
-    Direct Crossref DOI lookup for abstract.
-    Works for papers where the search endpoint omits the abstract field.
+    Semantic Scholar paper lookup — good coverage for older pre-2000 papers.
+    Free, no key required for low volume.
     """
     if not doi:
         return None
+    doi_clean = doi.replace("https://doi.org/", "").strip()
+    try:
+        resp = await client.get(
+            f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi_clean}",
+            params={"fields": "abstract"},
+            timeout=8,
+            headers={"User-Agent": "TriFieldAI/1.0"}
+        )
+        if resp.status_code == 200:
+            abstract = resp.json().get("abstract") or ""
+            return _clean_abstract(abstract)
+    except Exception:
+        pass
+    return None
+
+
+async def _fetch_abstract_by_doi(doi: str, client: httpx.AsyncClient) -> str | None:
+    """
+    Abstract pipeline: Crossref first, Semantic Scholar as fallback.
+    Crossref: best coverage post-2000.
+    Semantic Scholar: best for older papers with curated abstracts.
+    Both run sequentially only if needed — fast path exits early.
+    """
+    abstract = await _fetch_abstract_crossref(doi, client)
+    if abstract:
+        return abstract
+    return await _fetch_abstract_s2(doi, client)
     doi_clean = doi.replace("https://doi.org/", "").strip()
     try:
         resp = await client.get(
