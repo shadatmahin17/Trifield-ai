@@ -30,9 +30,10 @@ DISCIPLINE_KEYWORDS = {
         "textile composite", "woven composite", "woven fabric composite",
         "natural fibre composite", "natural fiber composite",
         "jute composite", "flax composite", "hemp composite",
-        "hybrid composite", "bast fibre", "bast fiber",
+        "jute", "flax", "hemp", "ramie", "kenaf", "sisal", "coir",
+        "bast fibre", "bast fiber", "natural fiber reinforced",
         "fabric reinforced", "preform", "woven reinforcement",
-        "technical textile", "braided composite",
+        "technical textile", "braided composite", "natural fibre reinforced",
     ],
 }
 
@@ -40,7 +41,7 @@ DISCIPLINE_KEYWORDS = {
 DISCIPLINE_MIN_SCORE = {
     "aerospace": 1,
     "materials": 1,
-    "textile":   2,   # stricter — textile has more noise
+    "textile":   1,   # junk now handled by _is_junk() — no need for high score
     "all":       0,
 }
 
@@ -56,7 +57,7 @@ EXCLUDE_CONCEPTS = {
     "C185592680",  # Pure chemistry
 }
 
-# Junk result patterns — filter out standards docs, patents, etc.
+# Junk result patterns — filter out standards, patents, literary works, etc.
 JUNK_TITLE_PATTERNS = [
     r"^specification for",
     r"^standard for",
@@ -65,6 +66,20 @@ JUNK_TITLE_PATTERNS = [
     r"^astm [a-z]",
     r"twines made from",
     r"^patent",
+]
+
+# Journals that should never appear in engineering results
+JUNK_JOURNALS = [
+    "revista canaria",
+    "english studies",
+    "journal of english",
+    "literary",
+    "humanities",
+    "social science",
+    "economics",
+    "psychology",
+    "nursing",
+    "law review",
 ]
 
 
@@ -94,20 +109,36 @@ def _is_excluded(concepts: list) -> bool:
 
 
 def _is_junk(paper: dict) -> bool:
-    """Filter out standards, specs, patents, and papers with no useful metadata."""
-    title = (paper.get("title") or "").lower().strip()
+    """Filter out standards, specs, patents, literary works, and no-metadata papers."""
+    title   = (paper.get("title") or "").lower().strip()
+    journal = (paper.get("journal") or "").lower().strip()
 
-    # No title or no year and no authors = useless
+    # No title = useless
     if not title:
         return True
-    has_authors = bool(paper.get("authors"))
-    has_year    = bool(paper.get("year"))
-    if not has_authors and not has_year:
+
+    # No authors AND no year = useless stub
+    if not paper.get("authors") and not paper.get("year"):
         return True
 
-    # Match junk title patterns
+    # Title matches junk patterns
     for pat in JUNK_TITLE_PATTERNS:
         if re.match(pat, title, re.IGNORECASE):
+            return True
+
+    # Journal matches non-engineering journals
+    for junk in JUNK_JOURNALS:
+        if junk in journal:
+            return True
+
+    # Abstract/title mismatch: abstract mentions composites but title is clearly
+    # a non-engineering paper (e.g. literary paper with injected composite abstract)
+    non_eng_title_words = [
+        "novel", "poetry", "poem", "fiction", "literature", "artistry",
+        "pamela", "shakespeare", "biblical", "rhetoric", "narrative",
+    ]
+    for word in non_eng_title_words:
+        if word in title:
             return True
 
     return False
