@@ -6,9 +6,8 @@ from models.schemas import Paper, Author
 
 # ── Cache ──────────────────────────────────────────────────────────────────
 _cache: dict[str, dict] = {}
-CACHE_TTL = 3600  # 1 hour
+CACHE_TTL = 3600
 
-# ── Discipline config ──────────────────────────────────────────────────────
 DISCIPLINE_KEYWORDS = {
     "aerospace": [
         "aerospace", "aeronautics", "aircraft", "spacecraft", "laminate",
@@ -28,74 +27,89 @@ DISCIPLINE_KEYWORDS = {
     ],
 }
 
-# OpenAlex concept IDs for discipline filtering (speeds up results)
 DISCIPLINE_CONCEPTS = {
-    "aerospace": "C27206212",   # Aerospace engineering
-    "materials": "C192562407",  # Materials science
-    "textile":   "C107038049",  # Textile engineering
+    "aerospace": "C27206212",
+    "materials": "C192562407",
+    "textile":   "C107038049",
 }
 
 
 def tag_discipline(title: str, abstract: str | None, concepts: list) -> str:
-    """Tag a paper with a discipline based on concepts and text."""
-    # Check OpenAlex concept tags first
     concept_names = " ".join(c.get("display_name", "").lower() for c in concepts)
     text = (title + " " + (abstract or "") + " " + concept_names).lower()
-
-    scores = {disc: 0 for disc in DISCIPLINE_KEYWORDS}
-    for disc, keywords in DISCIPLINE_KEYWORDS.items():
-        for kw in keywords:
-            if kw in text:
-                scores[disc] += 1
-
+    scores = {d: sum(1 for kw in kws if kw in text)
+              for d, kws in DISCIPLINE_KEYWORDS.items()}
     best = max(scores, key=lambda d: scores[d])
     return best if scores[best] > 0 else "general"
 
 
 def _cache_key(query, discipline, year_from, year_to, limit) -> str:
-    raw = f"{query}|{discipline}|{year_from}|{year_to}|{limit}"
-    return hashlib.md5(raw.encode()).hexdigest()
+    return hashlib.md5(f"{query}|{discipline}|{year_from}|{year_to}|{limit}".encode()).hexdigest()
 
 
-def _get_cached(key: str) -> list | None:
+def _get_cached(key):
     entry = _cache.get(key)
-    if entry and time.time() < entry["expires"]:
-        return entry["papers"]
-    return None
+    return entry["papers"] if entry and time.time() < entry["expires"] else None
 
 
-def _set_cache(key: str, papers: list):
+def _set_cache(key, papers):
     _cache[key] = {"papers": papers, "expires": time.time() + CACHE_TTL}
 
 
+def _reconstruct_abstract(inverted_index: dict | None) -> str | None:
+    """Reconstruct abstract from OpenAlex inverted index format."""
+    if not inverted_index:
+        return None
+    try:
+        positions = {}
+        for word, pos_list in inverted_index.items():
+            for pos in pos_list:
+                positions[pos] = word
+        if not positions:
+            return None
+        return " ".join(positions[i] for i in sorted(positions.keys()))
+    except Exception:
+        return None
+
+
 async def _fetch_openalex(params: dict, max_retries: int = 3) -> dict:
-    """
-    Fetch from OpenAlex API with retry.
-    Completely free — no API key required.
-    Rate limit: 10 req/sec (very generous, rarely hit).
-    """
     url = "https://api.openalex.org/works"
-
-    # Polite pool — add your email for faster responses (optional)
     params["mailto"] = "contact@trifield.ai"
-
     delays = [1, 3, 6]
+
     async with httpx.AsyncClient(timeout=20) as client:
         for attempt in range(max_retries):
             resp = await client.get(url, params=params)
-
             if resp.status_code == 200:
                 return resp.json()
-
             if resp.status_code == 429:
                 if attempt < max_retries - 1:
                     await asyncio.sleep(delays[attempt])
                     continue
-                raise Exception("OpenAlex rate limit reached. Please wait a moment and retry.")
-
+                raise Exception("Rate limit reached. Please wait a moment and retry.")
             resp.raise_for_status()
 
     return {"results": [], "meta": {"count": 0}}
+
+
+async def _get_oa_url_unpaywall(doi: str) -> str | None:
+    """Fallback: check Unpaywall for free PDF URL."""
+    if not doi:
+        return None
+    # Extract just the DOI part if it's a full URL
+    doi_clean = doi.replace("https://doi.org/", "").replace("http://doi.org/", "")
+    url = f"https://api.unpaywall.org/v2/{doi_clean}?email=contact@trifield.ai"
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                # Best OA location
+                best = data.get("best_oa_location") or {}
+                return best.get("url_for_pdf") or best.get("url")
+    except Exception:
+        pass
+    return None
 
 
 async def search_papers(
@@ -106,70 +120,67 @@ async def search_papers(
     limit:     int = 10,
 ) -> list[Paper]:
 
-    # 1. Cache check
+    # Cache check
     key = _cache_key(query, discipline, year_from, year_to, limit)
     cached = _get_cached(key)
     if cached is not None:
         return cached
 
-    # 2. Build OpenAlex params
-    # OpenAlex uses "search" for full-text search across title+abstract
+    # Build params — include abstract_inverted_index explicitly
     params: dict = {
-        "search":     query,
-        "per_page":   min(limit, 50),
-        "select":     (
-            "id,title,authorships,publication_year,abstract_inverted_index,"
-            "cited_by_count,doi,primary_location,open_access,concepts"
+        "search":   query,
+        "per_page": min(limit, 50),
+        "select": (
+            "id,title,authorships,publication_year,"
+            "abstract_inverted_index,"           # ← key fix for abstracts
+            "cited_by_count,doi,"
+            "primary_location,open_access,concepts"
         ),
         "sort": "relevance_score:desc",
     }
 
-    # Add discipline concept filter
+    # Discipline concept filter
+    filters = []
     if discipline != "all" and discipline in DISCIPLINE_CONCEPTS:
-        params["filter"] = f"concepts.id:{DISCIPLINE_CONCEPTS[discipline]}"
+        filters.append(f"concepts.id:{DISCIPLINE_CONCEPTS[discipline]}")
 
-    # Year filter
-    year_filters = []
+    # Year filters
     if year_from:
-        year_filters.append(f"publication_year:>{year_from - 1}")
+        filters.append(f"publication_year:>{year_from - 1}")
     if year_to:
-        year_filters.append(f"publication_year:<{year_to + 1}")
-    if year_filters:
-        existing = params.get("filter", "")
-        combined = ",".join([existing] + year_filters) if existing else ",".join(year_filters)
-        params["filter"] = combined
+        filters.append(f"publication_year:<{year_to + 1}")
 
-    # 3. Fetch
+    if filters:
+        params["filter"] = ",".join(filters)
+
+    # Fetch from OpenAlex
     data = await _fetch_openalex(params)
 
-    # 4. Parse OpenAlex results
+    # Parse results
     papers = []
     for item in data.get("results", []):
 
-        # Reconstruct abstract from inverted index
         abstract = _reconstruct_abstract(item.get("abstract_inverted_index"))
-
-        # Authors
-        authors = [
+        authors  = [
             Author(name=a.get("author", {}).get("display_name", "Unknown"))
-            for a in item.get("authorships", [])[:10]  # cap at 10 authors
+            for a in item.get("authorships", [])[:10]
         ]
 
-        # Journal / venue
-        primary = item.get("primary_location") or {}
-        source  = primary.get("source") or {}
-        journal = source.get("display_name")
+        primary  = item.get("primary_location") or {}
+        source   = primary.get("source") or {}
+        journal  = source.get("display_name")
 
-        # Open access PDF
-        oa      = item.get("open_access") or {}
-        oa_url  = oa.get("oa_url")
+        # Open access URL — use OpenAlex first, Unpaywall as fallback
+        oa       = item.get("open_access") or {}
+        oa_url   = oa.get("oa_url")
 
-        # DOI url
-        doi     = item.get("doi")  # already full URL e.g. https://doi.org/10.xxxx
+        doi      = item.get("doi")  # full URL e.g. https://doi.org/10.xxxx
         paper_url = doi or f"https://openalex.org/{item.get('id','').split('/')[-1]}"
+        concepts  = item.get("concepts") or []
 
-        # Concepts for discipline tagging
-        concepts = item.get("concepts") or []
+        # Unpaywall fallback for open access (only if no OA url found)
+        if not oa_url and doi:
+            oa_url = await _get_oa_url_unpaywall(doi)
 
         papers.append(Paper(
             paper_id        = item.get("id", "").split("/")[-1],
@@ -181,29 +192,11 @@ async def search_papers(
             url             = paper_url,
             open_access_url = oa_url,
             journal         = journal,
-            discipline_tag  = tag_discipline(
-                item.get("title", ""), abstract, concepts
-            ),
+            discipline_tag  = tag_discipline(item.get("title", ""), abstract, concepts),
         ))
+
+    if discipline != "all":
+        papers.sort(key=lambda p: 0 if p.discipline_tag == discipline else 1)
 
     _set_cache(key, papers)
     return papers
-
-
-def _reconstruct_abstract(inverted_index: dict | None) -> str | None:
-    """
-    OpenAlex stores abstracts as inverted index: {"word": [positions]}.
-    This reconstructs the original text.
-    """
-    if not inverted_index:
-        return None
-    try:
-        words = {}
-        for word, positions in inverted_index.items():
-            for pos in positions:
-                words[pos] = word
-        if not words:
-            return None
-        return " ".join(words[i] for i in sorted(words.keys()))
-    except Exception:
-        return None
