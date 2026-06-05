@@ -1,29 +1,33 @@
 import httpx
 import asyncio
 import hashlib
+import re
 import time
+import xml.etree.ElementTree as ET
 from models.schemas import Paper, Author
 
 # ── Cache ──────────────────────────────────────────────────────────────────
 _cache: dict[str, dict] = {}
 CACHE_TTL = 3600
 
+# ── Discipline config ──────────────────────────────────────────────────────
 DISCIPLINE_KEYWORDS = {
     "aerospace": [
-        "aerospace", "aeronautics", "aircraft", "spacecraft", "laminate",
-        "carbon fibre", "carbon fiber", "structural composite", "sandwich structure",
-        "fatigue", "damage tolerance", "airframe", "aerostructure",
+        "aerospace", "aeronautics", "aircraft", "spacecraft", "cfrp",
+        "carbon fibre", "carbon fiber", "airframe", "aerostructure",
+        "damage tolerance", "composite laminate", "sandwich panel",
+        "aeroelastic", "fuselage", "wing structure", "fatigue crack",
     ],
     "materials": [
         "composite", "hybrid composite", "nanocomposite", "polymer matrix",
-        "epoxy", "resin", "fibre reinforced", "fiber reinforced",
-        "mechanical properties", "tensile strength", "flexural", "void content",
-        "fibre volume fraction", "delamination", "fracture",
+        "epoxy", "fibre reinforced", "fiber reinforced", "tensile strength",
+        "flexural strength", "void content", "fibre volume fraction",
+        "delamination", "fracture toughness", "matrix cracking", "interlaminar",
     ],
     "textile": [
-        "textile", "woven", "woven fabric", "weave", "yarn", "braided",
-        "knitted", "nonwoven", "jute", "flax", "hemp", "natural fibre",
-        "natural fiber", "technical textile", "preform", "fabric structure",
+        "textile", "woven fabric", "weave", "yarn", "braided", "knitted",
+        "nonwoven", "jute", "flax", "hemp", "natural fibre", "natural fiber",
+        "technical textile", "preform", "fabric structure", "spinning", "dyeing",
     ],
 }
 
@@ -33,8 +37,25 @@ DISCIPLINE_CONCEPTS = {
     "textile":   "C107038049",
 }
 
+EXCLUDE_CONCEPTS = {
+    "C127413603",  # Civil engineering
+    "C144024400",  # Medicine
+    "C185592680",  # Pure chemistry
+}
 
-def tag_discipline(title: str, abstract: str | None, concepts: list) -> str:
+
+# ══════════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════════
+
+def _score(title: str, abstract: str | None, discipline: str) -> int:
+    if discipline == "all":
+        return 1
+    text = (title + " " + (abstract or "")).lower()
+    return sum(1 for kw in DISCIPLINE_KEYWORDS.get(discipline, []) if kw in text)
+
+
+def _tag_discipline(title: str, abstract: str | None, concepts: list) -> str:
     concept_names = " ".join(c.get("display_name", "").lower() for c in concepts)
     text = (title + " " + (abstract or "") + " " + concept_names).lower()
     scores = {d: sum(1 for kw in kws if kw in text)
@@ -43,74 +64,445 @@ def tag_discipline(title: str, abstract: str | None, concepts: list) -> str:
     return best if scores[best] > 0 else "general"
 
 
-def _cache_key(query, discipline, year_from, year_to, limit) -> str:
-    return hashlib.md5(f"{query}|{discipline}|{year_from}|{year_to}|{limit}".encode()).hexdigest()
+def _is_excluded(concepts: list) -> bool:
+    ids = {c.get("id", "").split("/")[-1] for c in concepts}
+    return bool(ids & EXCLUDE_CONCEPTS)
+
+
+def _reconstruct_abstract(inv: dict | None) -> str | None:
+    if not inv:
+        return None
+    try:
+        pos = {}
+        for word, positions in inv.items():
+            for p in positions:
+                pos[p] = word
+        return " ".join(pos[i] for i in sorted(pos)) or None
+    except Exception:
+        return None
+
+
+def _clean_abstract(text: str | None) -> str | None:
+    if not text:
+        return None
+    text = re.sub(r"<[^>]+>", "", text).strip()
+    return text if len(text) > 30 else None
+
+
+def _norm_title(t: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", t.lower())[:80]
+
+
+def _cache_key(*args) -> str:
+    return hashlib.md5("|".join(str(a) for a in args).encode()).hexdigest()
 
 
 def _get_cached(key):
-    entry = _cache.get(key)
-    return entry["papers"] if entry and time.time() < entry["expires"] else None
+    e = _cache.get(key)
+    return e["papers"] if e and time.time() < e["expires"] else None
 
 
 def _set_cache(key, papers):
     _cache[key] = {"papers": papers, "expires": time.time() + CACHE_TTL}
 
 
-def _reconstruct_abstract(inverted_index: dict | None) -> str | None:
-    """Reconstruct abstract from OpenAlex inverted index format."""
-    if not inverted_index:
-        return None
+# ══════════════════════════════════════════════════════════════════
+#  SOURCE 1 — OpenAlex
+# ══════════════════════════════════════════════════════════════════
+
+async def _search_openalex(
+    query: str, discipline: str, year_from, year_to, limit: int,
+    client: httpx.AsyncClient
+) -> list[dict]:
+    params = {
+        "search":   query,
+        "per_page": min(limit * 2, 50),
+        "select": (
+            "id,title,authorships,publication_year,"
+            "abstract_inverted_index,cited_by_count,doi,"
+            "primary_location,open_access,concepts"
+        ),
+        "sort":   "relevance_score:desc",
+        "mailto": "contact@trifield.ai",
+    }
+    filters = []
+    if discipline != "all" and discipline in DISCIPLINE_CONCEPTS:
+        filters.append(f"concepts.id:{DISCIPLINE_CONCEPTS[discipline]}")
+    if year_from:
+        filters.append(f"publication_year:>{year_from - 1}")
+    if year_to:
+        filters.append(f"publication_year:<{year_to + 1}")
+    if filters:
+        params["filter"] = ",".join(filters)
+
     try:
-        positions = {}
-        for word, pos_list in inverted_index.items():
-            for pos in pos_list:
-                positions[pos] = word
-        if not positions:
-            return None
-        return " ".join(positions[i] for i in sorted(positions.keys()))
+        resp = await client.get(
+            "https://api.openalex.org/works", params=params, timeout=15
+        )
+        if resp.status_code != 200:
+            return []
+        papers = []
+        for item in resp.json().get("results", []):
+            doi      = item.get("doi") or ""
+            abstract = _reconstruct_abstract(item.get("abstract_inverted_index"))
+            oa       = item.get("open_access") or {}
+            primary  = item.get("primary_location") or {}
+            source   = primary.get("source") or {}
+            authors  = [
+                Author(name=a.get("author", {}).get("display_name", "Unknown"))
+                for a in item.get("authorships", [])[:10]
+            ]
+            papers.append({
+                "paper_id":        item.get("id", "").split("/")[-1],
+                "title":           item.get("title") or "",
+                "authors":         authors,
+                "year":            item.get("publication_year"),
+                "abstract":        abstract,
+                "citation_count":  item.get("cited_by_count", 0),
+                "doi":             doi,
+                "url":             doi or "",
+                "open_access_url": oa.get("oa_url"),
+                "journal":         source.get("display_name"),
+                "concepts":        item.get("concepts") or [],
+                "source":          "openalex",
+            })
+        return papers
     except Exception:
-        return None
+        return []
 
 
-async def _fetch_openalex(params: dict, max_retries: int = 3) -> dict:
-    url = "https://api.openalex.org/works"
-    params["mailto"] = "contact@trifield.ai"
-    delays = [1, 3, 6]
+# ══════════════════════════════════════════════════════════════════
+#  SOURCE 2 — Crossref
+# ══════════════════════════════════════════════════════════════════
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        for attempt in range(max_retries):
-            resp = await client.get(url, params=params)
-            if resp.status_code == 200:
-                return resp.json()
-            if resp.status_code == 429:
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(delays[attempt])
-                    continue
-                raise Exception("Rate limit reached. Please wait a moment and retry.")
-            resp.raise_for_status()
+async def _search_crossref(
+    query: str, discipline: str, year_from, year_to, limit: int,
+    client: httpx.AsyncClient
+) -> list[dict]:
+    params = {
+        "query":  query,
+        "rows":   min(limit * 2, 40),
+        "select": "DOI,title,author,published,abstract,container-title,is-referenced-by-count",
+        "sort":   "relevance",
+        "mailto": "contact@trifield.ai",
+    }
+    year_filter_parts = []
+    if year_from:
+        year_filter_parts.append(f"from-pub-date:{year_from}")
+    if year_to:
+        year_filter_parts.append(f"until-pub-date:{year_to}")
+    if year_filter_parts:
+        params["filter"] = ",".join(year_filter_parts)
 
-    return {"results": [], "meta": {"count": 0}}
+    try:
+        resp = await client.get(
+            "https://api.crossref.org/works", params=params, timeout=15,
+            headers={"User-Agent": "TriFieldAI/1.0 (contact@trifield.ai)"}
+        )
+        if resp.status_code != 200:
+            return []
+        papers = []
+        for item in resp.json().get("message", {}).get("items", []):
+            doi         = item.get("DOI") or ""
+            title_list  = item.get("title") or []
+            title       = title_list[0] if title_list else ""
+            if not title:
+                continue
+            authors = [
+                Author(name=f"{a.get('given','')} {a.get('family','')}".strip())
+                for a in item.get("author", [])[:10]
+            ]
+            pub        = item.get("published") or {}
+            date_parts = pub.get("date-parts") or [[None]]
+            year       = date_parts[0][0] if date_parts and date_parts[0] else None
+            abstract   = _clean_abstract(item.get("abstract") or "")
+            journal    = (item.get("container-title") or [""])[0] or None
+
+            papers.append({
+                "paper_id":        f"CR_{doi.replace('/','_')}",
+                "title":           title,
+                "authors":         authors,
+                "year":            year,
+                "abstract":        abstract,
+                "citation_count":  item.get("is-referenced-by-count") or 0,
+                "doi":             f"https://doi.org/{doi}" if doi else "",
+                "url":             f"https://doi.org/{doi}" if doi else "",
+                "open_access_url": None,
+                "journal":         journal,
+                "concepts":        [],
+                "source":          "crossref",
+            })
+        return papers
+    except Exception:
+        return []
 
 
-async def _get_oa_url_unpaywall(doi: str) -> str | None:
-    """Fallback: check Unpaywall for free PDF URL."""
+# ══════════════════════════════════════════════════════════════════
+#  SOURCE 3 — arXiv
+# ══════════════════════════════════════════════════════════════════
+
+async def _search_arxiv(
+    query: str, discipline: str, year_from, year_to, limit: int,
+    client: httpx.AsyncClient
+) -> list[dict]:
+    cat_map = {
+        "aerospace": "cat:cond-mat.mtrl-sci OR cat:physics.flu-dyn",
+        "materials": "cat:cond-mat.mtrl-sci",
+        "textile":   "cat:cond-mat.soft",
+        "all":       "",
+    }
+    cat          = cat_map.get(discipline, "")
+    search_query = f"all:{query}"
+    if cat:
+        search_query = f"({search_query}) AND ({cat})"
+
+    params = {
+        "search_query": search_query,
+        "start":        0,
+        "max_results":  min(limit, 20),
+        "sortBy":       "relevance",
+        "sortOrder":    "descending",
+    }
+
+    try:
+        resp = await client.get(
+            "https://export.arxiv.org/api/query", params=params, timeout=15
+        )
+        if resp.status_code != 200:
+            return []
+
+        ns   = {"atom": "http://www.w3.org/2005/Atom",
+                "arxiv": "http://arxiv.org/schemas/atom"}
+        root = ET.fromstring(resp.text)
+        papers = []
+
+        for entry in root.findall("atom:entry", ns):
+            arxiv_id = (entry.findtext("atom:id", "", ns) or "").split("/abs/")[-1]
+            title    = (entry.findtext("atom:title", "", ns) or "").replace("\n", " ").strip()
+            abstract = (entry.findtext("atom:summary", "", ns) or "").replace("\n", " ").strip()
+            if not title:
+                continue
+
+            published = entry.findtext("atom:published", "", ns) or ""
+            year      = int(published[:4]) if len(published) >= 4 else None
+
+            if year_from and year and year < year_from:
+                continue
+            if year_to and year and year > year_to:
+                continue
+
+            authors = [
+                Author(name=a.findtext("atom:name", "", ns) or "Unknown")
+                for a in entry.findall("atom:author", ns)
+            ][:10]
+
+            doi_tag = entry.findtext("arxiv:doi", None, ns)
+            doi_url = f"https://doi.org/{doi_tag}" if doi_tag else ""
+            pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
+
+            papers.append({
+                "paper_id":        f"AR_{arxiv_id.replace('.','_')}",
+                "title":           title,
+                "authors":         authors,
+                "year":            year,
+                "abstract":        abstract or None,
+                "citation_count":  0,
+                "doi":             doi_url,
+                "url":             doi_url or f"https://arxiv.org/abs/{arxiv_id}",
+                "open_access_url": pdf_url,
+                "journal":         "arXiv preprint",
+                "concepts":        [],
+                "source":          "arxiv",
+            })
+        return papers
+    except Exception:
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SOURCE 4 — PubMed
+# ══════════════════════════════════════════════════════════════════
+
+async def _search_pubmed(
+    query: str, discipline: str, year_from, year_to, limit: int,
+    client: httpx.AsyncClient
+) -> list[dict]:
+    if discipline == "aerospace":
+        return []   # PubMed not relevant for pure aerospace
+
+    search_params = {
+        "db":      "pubmed",
+        "term":    f"{query} AND (composite OR textile OR fibre OR fiber)",
+        "retmax":  min(limit, 15),
+        "retmode": "json",
+        "sort":    "relevance",
+        "tool":    "TriFieldAI",
+        "email":   "contact@trifield.ai",
+    }
+    if year_from:
+        search_params["mindate"] = str(year_from)
+    if year_to:
+        search_params["maxdate"] = str(year_to)
+
+    try:
+        resp = await client.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+            params=search_params, timeout=12
+        )
+        if resp.status_code != 200:
+            return []
+        pmids = resp.json().get("esearchresult", {}).get("idlist", [])
+        if not pmids:
+            return []
+
+        fetch_resp = await client.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
+            params={
+                "db":      "pubmed",
+                "id":      ",".join(pmids),
+                "retmode": "xml",
+                "tool":    "TriFieldAI",
+                "email":   "contact@trifield.ai",
+            },
+            timeout=12
+        )
+        if fetch_resp.status_code != 200:
+            return []
+
+        root   = ET.fromstring(fetch_resp.text)
+        papers = []
+
+        for article in root.findall(".//PubmedArticle"):
+            medline = article.find("MedlineCitation")
+            if medline is None:
+                continue
+            art = medline.find("Article")
+            if art is None:
+                continue
+
+            pmid     = (medline.findtext("PMID") or "").strip()
+            title    = (art.findtext("ArticleTitle") or "").strip()
+            if not title:
+                continue
+
+            abs_el   = art.find("Abstract/AbstractText")
+            abstract = abs_el.text.strip() if abs_el is not None and abs_el.text else None
+
+            pub_date = art.find(".//PubDate")
+            year     = None
+            if pub_date is not None:
+                yr = pub_date.findtext("Year")
+                year = int(yr) if yr and yr.isdigit() else None
+
+            authors = []
+            for a in art.findall("AuthorList/Author")[:10]:
+                last = a.findtext("LastName") or ""
+                fore = a.findtext("ForeName") or ""
+                name = f"{fore} {last}".strip()
+                if name:
+                    authors.append(Author(name=name))
+
+            journal = art.findtext("Journal/Title")
+            doi     = ""
+            for id_el in article.findall(".//ArticleId"):
+                if id_el.get("IdType") == "doi":
+                    doi = id_el.text or ""
+                    break
+
+            papers.append({
+                "paper_id":        f"PM_{pmid}",
+                "title":           title,
+                "authors":         authors,
+                "year":            year,
+                "abstract":        abstract,
+                "citation_count":  0,
+                "doi":             f"https://doi.org/{doi}" if doi else "",
+                "url":             (f"https://doi.org/{doi}" if doi
+                                    else f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"),
+                "open_access_url": (f"https://www.ncbi.nlm.nih.gov/pmc/articles/pmid/{pmid}/"
+                                    if pmid else None),
+                "journal":         journal,
+                "concepts":        [],
+                "source":          "pubmed",
+            })
+        return papers
+    except Exception:
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SOURCE 5 — Unpaywall (OA enrichment only)
+# ══════════════════════════════════════════════════════════════════
+
+async def _get_oa_url(doi: str, client: httpx.AsyncClient) -> str | None:
     if not doi:
         return None
-    # Extract just the DOI part if it's a full URL
-    doi_clean = doi.replace("https://doi.org/", "").replace("http://doi.org/", "")
-    url = f"https://api.unpaywall.org/v2/{doi_clean}?email=contact@trifield.ai"
+    doi_clean = doi.replace("https://doi.org/", "").strip()
     try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            resp = await client.get(url)
-            if resp.status_code == 200:
-                data = resp.json()
-                # Best OA location
-                best = data.get("best_oa_location") or {}
-                return best.get("url_for_pdf") or best.get("url")
+        resp = await client.get(
+            f"https://api.unpaywall.org/v2/{doi_clean}?email=contact@trifield.ai",
+            timeout=6
+        )
+        if resp.status_code == 200:
+            best = resp.json().get("best_oa_location") or {}
+            return best.get("url_for_pdf") or best.get("url")
     except Exception:
         pass
     return None
 
+
+# ══════════════════════════════════════════════════════════════════
+#  MERGE + DEDUPLICATE
+# ══════════════════════════════════════════════════════════════════
+
+def _deduplicate(papers: list[dict]) -> list[dict]:
+    seen_dois:   set[str] = set()
+    seen_titles: set[str] = set()
+    by_key:      dict[str, dict] = {}
+
+    for p in papers:
+        doi   = (p.get("doi") or "").strip()
+        ntitle = _norm_title(p.get("title") or "")
+
+        match_key = doi if doi and doi in by_key else \
+                    ntitle if ntitle in by_key else None
+
+        if match_key:
+            existing = by_key[match_key]
+            # Merge best fields
+            if not existing.get("abstract") and p.get("abstract"):
+                existing["abstract"] = p["abstract"]
+            if not existing.get("open_access_url") and p.get("open_access_url"):
+                existing["open_access_url"] = p["open_access_url"]
+            if (p.get("citation_count") or 0) > (existing.get("citation_count") or 0):
+                existing["citation_count"] = p["citation_count"]
+            if p["source"] in ("crossref", "pubmed") and p.get("journal"):
+                existing["journal"] = p["journal"]
+        else:
+            if doi:
+                by_key[doi]    = p
+                seen_dois.add(doi)
+            if ntitle:
+                by_key[ntitle] = p
+                seen_titles.add(ntitle)
+
+    # Return unique papers in original order
+    seen:   set[str] = set()
+    result: list[dict] = []
+    for p in papers:
+        ntitle = _norm_title(p.get("title") or "")
+        if ntitle not in seen:
+            seen.add(ntitle)
+            # Return the merged version from by_key
+            doi = (p.get("doi") or "").strip()
+            merged = by_key.get(doi) or by_key.get(ntitle) or p
+            result.append(merged)
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MAIN SEARCH FUNCTION
+# ══════════════════════════════════════════════════════════════════
 
 async def search_papers(
     query: str,
@@ -120,83 +512,83 @@ async def search_papers(
     limit:     int = 10,
 ) -> list[Paper]:
 
-    # Cache check
-    key = _cache_key(query, discipline, year_from, year_to, limit)
+    # 1. Cache check
+    key    = _cache_key(query, discipline, year_from, year_to, limit)
     cached = _get_cached(key)
     if cached is not None:
         return cached
 
-    # Build params — include abstract_inverted_index explicitly
-    params: dict = {
-        "search":   query,
-        "per_page": min(limit, 50),
-        "select": (
-            "id,title,authorships,publication_year,"
-            "abstract_inverted_index,"           # ← key fix for abstracts
-            "cited_by_count,doi,"
-            "primary_location,open_access,concepts"
-        ),
-        "sort": "relevance_score:desc",
-    }
+    # 2. Query all 4 sources concurrently
+    async with httpx.AsyncClient(timeout=20) as client:
+        results = await asyncio.gather(
+            _search_openalex(query, discipline, year_from, year_to, limit, client),
+            _search_crossref(query, discipline, year_from, year_to, limit, client),
+            _search_arxiv(   query, discipline, year_from, year_to, limit, client),
+            _search_pubmed(  query, discipline, year_from, year_to, limit, client),
+            return_exceptions=True
+        )
 
-    # Discipline concept filter
-    filters = []
-    if discipline != "all" and discipline in DISCIPLINE_CONCEPTS:
-        filters.append(f"concepts.id:{DISCIPLINE_CONCEPTS[discipline]}")
+        # Flatten — skip any source that threw an exception
+        all_raw: list[dict] = []
+        for r in results:
+            if isinstance(r, list):
+                all_raw.extend(r)
 
-    # Year filters
-    if year_from:
-        filters.append(f"publication_year:>{year_from - 1}")
-    if year_to:
-        filters.append(f"publication_year:<{year_to + 1}")
+        # 3. Deduplicate
+        merged = _deduplicate(all_raw)
 
-    if filters:
-        params["filter"] = ",".join(filters)
+        # 4. Filter irrelevant papers
+        relevant: list[dict] = []
+        for p in merged:
+            if _is_excluded(p.get("concepts") or []):
+                continue
+            if _score(p.get("title",""), p.get("abstract"), discipline) < 1:
+                continue
+            relevant.append(p)
 
-    # Fetch from OpenAlex
-    data = await _fetch_openalex(params)
-
-    # Parse results
-    papers = []
-    for item in data.get("results", []):
-
-        abstract = _reconstruct_abstract(item.get("abstract_inverted_index"))
-        authors  = [
-            Author(name=a.get("author", {}).get("display_name", "Unknown"))
-            for a in item.get("authorships", [])[:10]
-        ]
-
-        primary  = item.get("primary_location") or {}
-        source   = primary.get("source") or {}
-        journal  = source.get("display_name")
-
-        # Open access URL — use OpenAlex first, Unpaywall as fallback
-        oa       = item.get("open_access") or {}
-        oa_url   = oa.get("oa_url")
-
-        doi      = item.get("doi")  # full URL e.g. https://doi.org/10.xxxx
-        paper_url = doi or f"https://openalex.org/{item.get('id','').split('/')[-1]}"
-        concepts  = item.get("concepts") or []
-
-        # Unpaywall fallback for open access (only if no OA url found)
-        if not oa_url and doi:
-            oa_url = await _get_oa_url_unpaywall(doi)
-
-        papers.append(Paper(
-            paper_id        = item.get("id", "").split("/")[-1],
-            title           = item.get("title") or "Untitled",
-            authors         = authors,
-            year            = item.get("publication_year"),
-            abstract        = abstract,
-            citation_count  = item.get("cited_by_count", 0),
-            url             = paper_url,
-            open_access_url = oa_url,
-            journal         = journal,
-            discipline_tag  = tag_discipline(item.get("title", ""), abstract, concepts),
+        # 5. Sort: discipline match first, then citation count descending
+        relevant.sort(key=lambda p: (
+            0 if _tag_discipline(
+                p.get("title",""), p.get("abstract"), p.get("concepts",[])
+            ) == discipline or discipline == "all" else 1,
+            -(p.get("citation_count") or 0)
         ))
 
-    if discipline != "all":
-        papers.sort(key=lambda p: 0 if p.discipline_tag == discipline else 1)
+        # 6. Take top N and enrich missing OA urls via Unpaywall
+        top = relevant[:limit]
+
+        async def _maybe_get_oa(p: dict) -> str | None:
+            if p.get("open_access_url"):
+                return p["open_access_url"]
+            return await _get_oa_url(p.get("doi",""), client)
+
+        oa_urls = await asyncio.gather(
+            *[_maybe_get_oa(p) for p in top],
+            return_exceptions=True
+        )
+
+    # 7. Build final Paper objects
+    papers: list[Paper] = []
+    for p, oa_url in zip(top, oa_urls):
+        final_oa = (p.get("open_access_url") or
+                    (oa_url if isinstance(oa_url, str) else None))
+        abstract = p.get("abstract")
+        concepts = p.get("concepts") or []
+
+        papers.append(Paper(
+            paper_id        = p["paper_id"],
+            title           = p["title"] or "Untitled",
+            authors         = p.get("authors") or [],
+            year            = p.get("year"),
+            abstract        = abstract,
+            citation_count  = p.get("citation_count") or 0,
+            url             = p.get("url") or "",
+            open_access_url = final_oa,
+            journal         = p.get("journal"),
+            discipline_tag  = _tag_discipline(
+                p.get("title",""), abstract, concepts
+            ),
+        ))
 
     _set_cache(key, papers)
     return papers
