@@ -1,25 +1,33 @@
 from fastapi import APIRouter, Query, HTTPException
 from services.search_service import search_papers
+from services.query_intelligence import analyse_query
 from models.schemas import SearchResponse
 
 router = APIRouter()
 
 @router.get("/", response_model=SearchResponse)
 async def search(
-    query:      str = Query(..., description="e.g. 'carbon fibre composite fatigue'"),
+    query:      str = Query(..., description="Natural language query — typos, abbreviations, and synonyms handled automatically"),
     discipline: str = Query("all", description="all | aerospace | materials | textile"),
-    year_from:  int = Query(None, description="Filter from year e.g. 2015"),
-    year_to:    int = Query(None, description="Filter to year e.g. 2024"),
+    year_from:  int = Query(None, description="Filter from year"),
+    year_to:    int = Query(None, description="Filter to year"),
     limit:      int = Query(10, description="Number of results (max 50)", le=50, ge=1),
 ):
     """
-    Search research papers via Semantic Scholar (free, no API key needed).
-    Results are cached for 1 hour — repeated queries are instant.
+    Intelligent paper search across OpenAlex, Crossref, arXiv, PubMed, and Unpaywall.
+
+    Features:
+    - Understands intent, not just exact keywords
+    - Corrects typos automatically (e.g. 'tenslie' → 'tensile')
+    - Expands abbreviations (e.g. 'CFRP' → 'carbon fibre reinforced polymer')
+    - Expands synonyms (e.g. 'jute' → adds 'bast fibre', 'corchorus')
+    - Detects discipline automatically if not specified
+    - Reranks results by relevance, entity match, and recency
 
     Examples:
-      /api/search/?query=jute+flax+hybrid+composite&discipline=textile
-      /api/search/?query=carbon+fibre+laminate+fatigue&discipline=aerospace&limit=5
-      /api/search/?query=3D+woven+composites+damage&discipline=materials&year_from=2018
+      /api/search/?query=jute flax hybrid composit mechanicl properteis
+      /api/search/?query=CFRP fatigue damage tolerance aerospace
+      /api/search/?query=fem simulation 3d woven unit cell model
     """
     try:
         papers = await search_papers(
@@ -29,19 +37,24 @@ async def search(
             year_to=year_to,
             limit=limit,
         )
+
+        # Include query intelligence info in response
+        analysis = analyse_query(query, discipline)
+
         return SearchResponse(
             query=query,
+            interpreted_query=analysis.primary_query,
+            intent=analysis.intent,
+            detected_discipline=analysis.discipline,
             total=len(papers),
             discipline=discipline,
             papers=papers,
         )
     except Exception as e:
         msg = str(e)
-        # Give friendly message for rate limit
         if "rate limit" in msg.lower() or "429" in msg:
             raise HTTPException(
                 status_code=429,
-                detail="Semantic Scholar rate limit reached. Wait 30 seconds and try again. "
-                       "Tip: repeated searches are cached and never hit the rate limit."
+                detail="Rate limit reached. Wait 30 seconds and retry. Cached searches are instant."
             )
         raise HTTPException(status_code=500, detail=msg)
