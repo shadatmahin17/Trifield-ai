@@ -26,10 +26,13 @@ class Paper(BaseModel):
     discipline_tag: Optional[str]
 
 class SearchResponse(BaseModel):
-    query:       str
-    total:       int
-    discipline:  str
-    papers:      list[Paper]
+    query:                str
+    interpreted_query:    Optional[str] = None   # what the AI understood
+    intent:               Optional[str] = None   # e.g. property_lookup, review, modelling
+    detected_discipline:  Optional[str] = None   # auto-detected discipline
+    total:                int
+    discipline:           str
+    papers:               list[Paper]
 
 
 # ── PDF Chat ─────────────────────────────────────────────
