@@ -1,140 +1,115 @@
 """
-LLM provider with automatic fallback.
+Smart LLM routing layer.
+Routes each task to the cheapest model that can handle it well.
 
-Priority:
-  1. Anthropic (Claude Haiku) — primary
-  2. Groq (Llama 3.3 70B)    — fallback when Anthropic credits exhausted
-
-Fallback triggers on:
-  - anthropic.AuthenticationError  (invalid / expired key)
-  - anthropic.PermissionDeniedError
-  - anthropic.RateLimitError       (quota exceeded, not just rate limit)
-  - Any error whose message contains "credit", "quota", "billing", "overload"
+Task routing:
+  search_rewrite    → Groq  (fast, cheap, good enough)
+  classification    → Groq  (fast, cheap)
+  search_explain    → Groq  (short output)
+  pdf_chat          → Claude (accuracy critical)
+  research_summary  → Claude (quality critical)
+  copilot_analysis  → Claude (complex reasoning)
+  property_extract  → Claude (structured extraction)
 """
 
 import httpx
-import json
 import logging
 from core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Errors that should trigger Groq fallback
 FALLBACK_TRIGGERS = (
     "credit", "quota", "billing", "insufficient_quota",
     "overloaded", "capacity", "529",
 )
 
+# Task → preferred model
+TASK_ROUTING = {
+    "search_rewrite":   "groq",
+    "classification":   "groq",
+    "search_explain":   "groq",
+    "pdf_chat":         "claude",
+    "research_summary": "claude",
+    "copilot_analysis": "claude",
+    "property_extract": "claude",
+    "default":          "claude",
+}
+
+GROQ_MODEL    = "llama-3.3-70b-versatile"
+CLAUDE_MODEL  = "claude-haiku-4-5"
+
+
 def _should_fallback(error: Exception) -> bool:
-    msg = str(error).lower()
-    return any(t in msg for t in FALLBACK_TRIGGERS)
+    return any(t in str(error).lower() for t in FALLBACK_TRIGGERS)
 
 
-async def _call_anthropic(
-    system: str,
-    messages: list[dict],
-    max_tokens: int = 1024,
-    model: str = "claude-haiku-4-5",
-) -> str:
-    """Call Anthropic Claude API."""
+async def _call_anthropic(system: str, messages: list, max_tokens: int) -> str:
     import anthropic
-    settings = get_settings()
-
-    if not settings.anthropic_api_key:
+    s = get_settings()
+    if not s.anthropic_api_key:
         raise ValueError("ANTHROPIC_API_KEY not set")
-
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-    response = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=system,
-        messages=messages,
+    client = anthropic.Anthropic(api_key=s.anthropic_api_key)
+    r = client.messages.create(
+        model=CLAUDE_MODEL, max_tokens=max_tokens,
+        system=system, messages=messages,
     )
-    return response.content[0].text
+    return r.content[0].text
 
 
-async def _call_groq(
-    system: str,
-    messages: list[dict],
-    max_tokens: int = 1024,
-    model: str = "llama-3.3-70b-versatile",
-) -> str:
-    """
-    Call Groq API (OpenAI-compatible endpoint).
-    Free tier: 14,400 requests/day, 500,000 tokens/minute.
-    """
-    settings = get_settings()
-
-    if not settings.groq_api_key:
-        raise ValueError("GROQ_API_KEY not set — no fallback available")
-
-    # Build messages in OpenAI format
+async def _call_groq(system: str, messages: list, max_tokens: int) -> str:
+    s = get_settings()
+    if not s.groq_api_key:
+        raise ValueError("GROQ_API_KEY not set")
     groq_messages = [{"role": "system", "content": system}] + messages
-
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.groq_api_key}",
-                "Content-Type":  "application/json",
-            },
-            json={
-                "model":      model,
-                "messages":   groq_messages,
-                "max_tokens": max_tokens,
-                "temperature": 0.3,
-            },
+            headers={"Authorization": f"Bearer {s.groq_api_key}", "Content-Type": "application/json"},
+            json={"model": GROQ_MODEL, "messages": groq_messages, "max_tokens": max_tokens, "temperature": 0.2},
         )
         resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        return resp.json()["choices"][0]["message"]["content"]
 
 
 async def llm_call(
     system: str,
-    messages: list[dict],
+    messages: list,
     max_tokens: int = 1024,
     prefer_json: bool = False,
+    task: str = "default",
 ) -> str:
-    """
-    Call LLM with automatic Anthropic → Groq fallback.
-
-    Args:
-        system:      System prompt string
-        messages:    List of {"role": "user"|"assistant", "content": "..."}
-        max_tokens:  Maximum tokens to generate
-        prefer_json: If True, append JSON instruction to system prompt
-
-    Returns:
-        Response text string
-    """
     if prefer_json:
-        system += "\n\nReturn ONLY valid JSON. No markdown, no explanation."
+        system += "\n\nReturn ONLY valid JSON. No markdown fences, no explanation."
 
-    settings = get_settings()
+    s = get_settings()
+    preferred = TASK_ROUTING.get(task, "claude")
 
-    # ── Try Anthropic first ──────────────────────────────────────
-    if settings.anthropic_api_key:
+    # Try preferred model first
+    if preferred == "groq" and s.groq_api_key:
+        try:
+            text = await _call_groq(system, messages, max_tokens)
+            logger.debug(f"LLM[{task}]: Groq OK")
+            return text
+        except Exception as e:
+            logger.warning(f"Groq failed for task '{task}', falling back to Claude: {e}")
+
+    if s.anthropic_api_key:
         try:
             text = await _call_anthropic(system, messages, max_tokens)
-            logger.debug("LLM: Anthropic OK")
+            logger.debug(f"LLM[{task}]: Claude OK")
             return text
         except Exception as e:
             if _should_fallback(e):
-                logger.warning(f"Anthropic quota/credit issue — falling back to Groq. Error: {e}")
+                logger.warning(f"Claude quota issue, trying Groq: {e}")
             else:
-                # Re-raise non-quota errors (e.g. bad prompt, network error)
                 raise
 
-    # ── Fallback to Groq ─────────────────────────────────────────
-    if settings.groq_api_key:
+    if s.groq_api_key:
         try:
             text = await _call_groq(system, messages, max_tokens)
-            logger.info("LLM: Groq fallback OK")
+            logger.info(f"LLM[{task}]: Groq fallback OK")
             return text
         except Exception as e:
-            raise RuntimeError(f"Both Anthropic and Groq failed. Groq error: {e}")
+            raise RuntimeError(f"Both models failed. Last error: {e}")
 
-    raise RuntimeError(
-        "No LLM available. Set ANTHROPIC_API_KEY and/or GROQ_API_KEY."
-    )
+    raise RuntimeError("No LLM available. Set ANTHROPIC_API_KEY or GROQ_API_KEY.")
