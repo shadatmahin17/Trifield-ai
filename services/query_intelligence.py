@@ -176,6 +176,9 @@ INTENT_PATTERNS = {
         r"\b(what is|find|get|show).*(strength|modulus|stiffness|density|conductivity)\b",
         r"\b(tensile|flexural|impact|shear|compression).*(strength|modulus|test)\b",
         r"\b(mechanical|physical|thermal|electrical)\s+propert",
+        r"\b(hybrid|natural).*(composite|laminate|fibre|fiber)\b",
+        r"\b(jute|flax|hemp|sisal|kenaf).*(composite|fibre|hybrid)\b",
+        r"\b(composite|laminate).*(propert|characteris|behav)\b",
     ],
     "fabrication": [
         r"\b(how to|process|fabricat|manufactur|mak|produc|creat)\b",
