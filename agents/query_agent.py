@@ -32,7 +32,7 @@ async def rewrite_query(raw_query: str, discipline: str = "all") -> dict:
                 prefer_json=True,
                 task="search_rewrite",
             ),
-            timeout=8.0   # don't let query rewriting slow down search
+            timeout=15.0  # Groq cold start can be slow on free tier
         )
         raw = raw.strip().replace("```json", "").replace("```", "").strip()
         llm_result = json.loads(raw)
