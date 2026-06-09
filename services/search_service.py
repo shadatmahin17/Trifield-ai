@@ -41,9 +41,23 @@ JUNK_JOURNALS       = ["revista canaria","english studies","literary","social sc
 NON_ENG_WORDS       = ["novel","poetry","poem","fiction","literature","artistry","pamela","shakespeare","biblical","rhetoric","narrative"]
 
 
+# Natural fibre names — title match forces textile tag
+_NATURAL_FIBRES = {
+    "jute","flax","hemp","ramie","kenaf","sisal","coir","bamboo",
+    "jute/flax","flax/jute","jute/glass","flax/glass","jute/ramie",
+    "natural fibre","natural fiber","bast fibre","bast fiber",
+}
+
 def _tag_discipline(title: str, abstract: str | None, concepts: list) -> str:
+    title_lower = (title or "").lower()
     concept_names = " ".join(c.get("display_name","").lower() for c in concepts)
-    text = (title + " " + (abstract or "") + " " + concept_names).lower()
+    text = (title_lower + " " + (abstract or "") + " " + concept_names).lower()
+
+    # Strong signal: natural fibre names in title → textile
+    for nf in _NATURAL_FIBRES:
+        if nf in title_lower:
+            return "textile"
+
     scores = {d: sum(1 for kw in kws if kw in text) for d, kws in DISCIPLINE_KEYWORDS.items()}
     best = max(scores, key=lambda d: scores[d])
     return best if scores[best] > 0 else "general"

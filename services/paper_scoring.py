@@ -42,6 +42,13 @@ TIER2_JOURNALS = {
     "industrial crops and products",
     "construction and building materials",
     "thin-walled structures",
+    "polymer composites",
+    "journal of natural fibres",
+    "cellulose",
+    "carbohydrate polymers",
+    "bioresource technology",
+    "heliyon",
+    "materials",
 }
 
 
