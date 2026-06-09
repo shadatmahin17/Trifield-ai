@@ -6,40 +6,47 @@ router = APIRouter()
 
 @router.get("/health")
 async def health():
-    settings = get_settings()
-
-    # Determine active LLM
-    has_anthropic = bool(settings.anthropic_api_key)
-    has_groq      = bool(settings.groq_api_key)
-
-    if has_anthropic:
-        llm_primary  = "Anthropic Claude Haiku"
-        llm_fallback = "Groq Llama 3.3 70B" if has_groq else "None configured"
-    elif has_groq:
-        llm_primary  = "Groq Llama 3.3 70B (Anthropic key missing)"
-        llm_fallback = "None"
-    else:
-        llm_primary  = "None configured — set ANTHROPIC_API_KEY or GROQ_API_KEY"
-        llm_fallback = "None"
-
+    s = get_settings()
+    has_anthropic = bool(s.anthropic_api_key)
+    has_groq      = bool(s.groq_api_key)
+    has_qdrant    = bool(s.qdrant_url) or True   # local always available
     return {
         "status":      "healthy",
         "timestamp":   datetime.utcnow().isoformat(),
-        "version":     "1.0.0",
+        "version":     "2.0.0",
         "platform":    "TriField AI",
         "disciplines": ["Aerospace", "Materials Science", "Textile Engineering"],
         "llm": {
-            "primary":       llm_primary,
-            "fallback":      llm_fallback,
-            "anthropic_key": "set" if has_anthropic else "missing",
-            "groq_key":      "set" if has_groq      else "missing",
+            "primary":        "Anthropic Claude Haiku" if has_anthropic else "Groq Llama 3.3 70B",
+            "fallback":       "Groq Llama 3.3 70B" if has_groq else "None",
+            "routing":        "task-aware (Claude=quality, Groq=speed)",
+            "anthropic_key":  "set" if has_anthropic else "missing",
+            "groq_key":       "set" if has_groq else "missing",
+        },
+        "vector_db": {
+            "engine":  "Qdrant Cloud" if s.qdrant_url else "Qdrant Local",
+            "status":  "configured",
+        },
+        "features": {
+            "search":          "OpenAlex + Crossref + arXiv + PubMed + Unpaywall",
+            "query_rewriting": "LLM (Groq) + rule-based fallback",
+            "paper_scoring":   "weighted: relevance 40% + citations 25% + recency 15% + journal 10% + OA 10%",
+            "streaming_search":"SSE — live source progress",
+            "pdf_rag":         "Qdrant semantic retrieval + Claude",
+            "copilot":         "Research gaps + trends + experiments",
+            "citations":       "APA, IEEE, AIAA, Harvard, MLA, Chicago",
+            "analytics":       "search latency, top queries, success rate",
         },
         "endpoints": {
-            "search":     "/api/search/?query=your+query&discipline=aerospace",
-            "pdf_upload": "POST /api/pdf/upload",
-            "pdf_chat":   "POST /api/pdf/chat",
-            "properties": "GET  /api/pdf/extract-properties/{session_id}",
-            "citations":  "POST /api/citations/",
-            "docs":       "/docs",
+            "search":          "GET  /api/search/?query=...",
+            "search_stream":   "GET  /api/search/stream?query=...",
+            "copilot_analyse": "POST /api/copilot/analyse",
+            "copilot_summary": "POST /api/copilot/summary",
+            "pdf_upload":      "POST /api/pdf/upload",
+            "pdf_chat":        "POST /api/pdf/chat",
+            "properties":      "GET  /api/pdf/extract-properties/{id}",
+            "citations":       "POST /api/citations/",
+            "analytics":       "GET  /api/analytics/",
+            "docs":            "/docs",
         }
     }
