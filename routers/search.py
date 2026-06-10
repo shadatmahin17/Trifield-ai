@@ -72,6 +72,9 @@ async def search_stream(
     from models.schemas import Paper
 
     async def event_stream():
+        nonlocal _stream_t0
+        _stream_t0 = time.time()
+
         def sse(event: str, data: dict) -> str:
             return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
@@ -167,7 +170,21 @@ async def search_stream(
             "total":       len(papers),
             "papers":      papers,
         })
+
+        # Record analytics for streaming search
+        stream_latency = round((time.time() - _stream_t0) * 1000, 1)
+        get_tracker().record_search(
+            query=query,
+            discipline=discipline,
+            result_count=len(papers),
+            latency_ms=stream_latency,
+            intent=rewrite.get("intent", "general"),
+            success=True,
+            source="stream",
+        )
+
         yield sse("done", {"message": "Search complete"})
 
+    _stream_t0 = time.time()
     return StreamingResponse(event_stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
