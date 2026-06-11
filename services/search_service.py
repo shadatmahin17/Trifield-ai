@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import re
 import time
+import logging
 import xml.etree.ElementTree as ET
 
 from models.schemas import Paper, Author
@@ -18,9 +19,12 @@ from services.paper_scoring import rank_papers
 from services.query_intelligence import analyse_query
 from agents.query_agent import rewrite_query
 
+logger = logging.getLogger(__name__)
+
 # ── Cache ──────────────────────────────────────────────────────────────────
 _cache: dict[str, dict] = {}
-CACHE_TTL = 3600
+CACHE_TTL   = 3600
+CACHE_MAXSIZE = 256   # BUG FIX: cap to prevent unbounded memory growth
 
 DISCIPLINE_CONCEPTS = {
     "aerospace": "C27206212",
@@ -107,10 +111,20 @@ def _cache_key(*args) -> str:
 
 def _get_cached(key):
     e = _cache.get(key)
-    return e["papers"] if e and time.time() < e["expires"] else None
+    if e is None:
+        return None
+    if time.time() >= e["expires"]:
+        # BUG FIX: delete expired entries so the dict doesn't grow unboundedly
+        del _cache[key]
+        return None
+    return e["papers"]
 
 
 def _set_cache(key, papers):
+    # BUG FIX: evict oldest entry when cache is full
+    if len(_cache) >= CACHE_MAXSIZE:
+        oldest_key = min(_cache, key=lambda k: _cache[k]["expires"])
+        del _cache[oldest_key]
     _cache[key] = {"papers": papers, "expires": time.time() + CACHE_TTL}
 
 
@@ -123,7 +137,8 @@ async def _fetch_abstract_crossref(doi: str, client: httpx.AsyncClient) -> str |
         resp = await client.get(f"https://api.crossref.org/works/{doi_clean}",timeout=7,headers={"User-Agent":"TriFieldAI/1.0 (contact@trifield.ai)"})
         if resp.status_code == 200:
             return _clean_abstract(resp.json().get("message",{}).get("abstract",""))
-    except: pass
+    except Exception as e:
+        logger.debug(f"Crossref abstract fetch failed: {e}")
     return None
 
 
@@ -134,7 +149,8 @@ async def _fetch_abstract_s2(doi: str, client: httpx.AsyncClient) -> str | None:
         resp = await client.get(f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi_clean}",params={"fields":"abstract"},timeout=7,headers={"User-Agent":"TriFieldAI/1.0"})
         if resp.status_code == 200:
             return _clean_abstract(resp.json().get("abstract",""))
-    except: pass
+    except Exception as e:
+        logger.debug(f"S2 abstract fetch failed: {e}")
     return None
 
 
@@ -146,7 +162,8 @@ async def _get_oa_url(doi: str, client: httpx.AsyncClient) -> str | None:
         if resp.status_code == 200:
             best = resp.json().get("best_oa_location") or {}
             return best.get("url_for_pdf") or best.get("url")
-    except: pass
+    except Exception as e:
+        logger.debug(f"Unpaywall fetch failed: {e}")
     return None
 
 
@@ -189,7 +206,9 @@ async def _search_openalex(query,discipline,year_from,year_to,limit,client):
             authors=[Author(name=a.get("author",{}).get("display_name","Unknown")) for a in item.get("authorships",[])[:10]]
             papers.append({"paper_id":item.get("id","").split("/")[-1],"title":item.get("title") or "","authors":authors,"year":item.get("publication_year"),"abstract":_reconstruct_abstract(item.get("abstract_inverted_index")),"citation_count":item.get("cited_by_count",0),"doi":doi,"url":doi or "","open_access_url":oa.get("oa_url"),"journal":source.get("display_name"),"concepts":item.get("concepts") or [],"source":"openalex"})
         return papers
-    except:return []
+    except Exception as e:
+        logger.warning(f"OpenAlex search failed: {e}")
+        return []
 
 
 async def _search_crossref(query,discipline,year_from,year_to,limit,client):
@@ -212,7 +231,9 @@ async def _search_crossref(query,discipline,year_from,year_to,limit,client):
             journal=(item.get("container-title") or [""])[0] or None
             papers.append({"paper_id":f"CR_{doi.replace('/','_')}","title":title,"authors":authors,"year":year,"abstract":_clean_abstract(item.get("abstract") or ""),"citation_count":item.get("is-referenced-by-count") or 0,"doi":f"https://doi.org/{doi}" if doi else "","url":f"https://doi.org/{doi}" if doi else "","open_access_url":None,"journal":journal,"concepts":[],"source":"crossref"})
         return papers
-    except:return []
+    except Exception as e:
+        logger.warning(f"Crossref search failed: {e}")
+        return []
 
 
 async def _search_arxiv(query,discipline,year_from,year_to,limit,client):
@@ -240,7 +261,9 @@ async def _search_arxiv(query,discipline,year_from,year_to,limit,client):
             doi_url=f"https://doi.org/{doi_tag}" if doi_tag else ""
             papers.append({"paper_id":f"AR_{arxiv_id.replace('.','_')}","title":title,"authors":authors,"year":year,"abstract":abstract or None,"citation_count":0,"doi":doi_url,"url":doi_url or f"https://arxiv.org/abs/{arxiv_id}","open_access_url":f"https://arxiv.org/pdf/{arxiv_id}","journal":"arXiv preprint","concepts":[],"source":"arxiv"})
         return papers
-    except:return []
+    except Exception as e:
+        logger.warning(f"arXiv search failed: {e}")
+        return []
 
 
 async def _search_pubmed(query,discipline,year_from,year_to,limit,client):
@@ -284,33 +307,68 @@ async def _search_pubmed(query,discipline,year_from,year_to,limit,client):
                 if id_el.get("IdType")=="doi":doi=id_el.text or "";break
             papers.append({"paper_id":f"PM_{pmid}","title":title,"authors":authors,"year":year,"abstract":abstract,"citation_count":0,"doi":f"https://doi.org/{doi}" if doi else "","url":f"https://doi.org/{doi}" if doi else f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/","open_access_url":f"https://www.ncbi.nlm.nih.gov/pmc/articles/pmid/{pmid}/" if pmid else None,"journal":journal,"concepts":[],"source":"pubmed"})
         return papers
-    except:return []
+    except Exception as e:
+        logger.warning(f"PubMed search failed: {e}")
+        return []
 
 
 def _deduplicate(papers: list[dict]) -> list[dict]:
-    by_key: dict[str, dict] = {}
+    """
+    BUG FIX: original code iterated the input list at the end, allowing
+    previously-merged duplicates to re-appear via their title-alias key.
+    Now we iterate by_key.values() directly — the already-deduplicated set.
+    """
+    by_doi:   dict[str, dict] = {}
+    by_title: dict[str, dict] = {}
+
     for p in papers:
-        doi=( p.get("doi") or "").strip()
-        ntitle=_norm(p.get("title") or "")
-        key=doi if doi else ntitle
-        if not key:continue
-        if key in by_key:
-            existing=by_key[key]
-            if not existing.get("abstract") and p.get("abstract"):existing["abstract"]=p["abstract"]
-            if not existing.get("open_access_url") and p.get("open_access_url"):existing["open_access_url"]=p["open_access_url"]
-            if (p.get("citation_count") or 0)>(existing.get("citation_count") or 0):existing["citation_count"]=p["citation_count"]
-            if p["source"] in ("crossref","pubmed") and p.get("journal"):existing["journal"]=p["journal"]
-        else:
-            by_key[key]=p
-            if ntitle and ntitle not in by_key:by_key[ntitle]=p
-    seen:set[str]=set()
-    result:list[dict]=[]
-    for p in papers:
-        ntitle=_norm(p.get("title") or "")
-        if ntitle and ntitle not in seen:
-            seen.add(ntitle)
-            doi=(p.get("doi") or "").strip()
-            result.append(by_key.get(doi) or by_key.get(ntitle) or p)
+        doi    = (p.get("doi") or "").strip()
+        ntitle = _norm(p.get("title") or "")
+
+        # Merge into existing entry if same DOI
+        if doi and doi in by_doi:
+            existing = by_doi[doi]
+            if not existing.get("abstract") and p.get("abstract"):
+                existing["abstract"] = p["abstract"]
+            if not existing.get("open_access_url") and p.get("open_access_url"):
+                existing["open_access_url"] = p["open_access_url"]
+            if (p.get("citation_count") or 0) > (existing.get("citation_count") or 0):
+                existing["citation_count"] = p["citation_count"]
+            if p["source"] in ("crossref","pubmed") and p.get("journal"):
+                existing["journal"] = p["journal"]
+            # keep title alias pointing to merged entry
+            if ntitle and ntitle not in by_title:
+                by_title[ntitle] = existing
+            continue
+
+        # Merge into existing entry if same normalised title (different source)
+        if ntitle and ntitle in by_title:
+            existing = by_title[ntitle]
+            if not existing.get("abstract") and p.get("abstract"):
+                existing["abstract"] = p["abstract"]
+            if not existing.get("open_access_url") and p.get("open_access_url"):
+                existing["open_access_url"] = p["open_access_url"]
+            if (p.get("citation_count") or 0) > (existing.get("citation_count") or 0):
+                existing["citation_count"] = p["citation_count"]
+            if p["source"] in ("crossref","pubmed") and p.get("journal"):
+                existing["journal"] = p["journal"]
+            if doi:
+                by_doi[doi] = existing
+            continue
+
+        # New entry
+        if doi:
+            by_doi[doi] = p
+        if ntitle:
+            by_title[ntitle] = p
+
+    # Collect unique papers — prefer DOI-keyed entries, fall back to title-keyed
+    seen: set[int] = set()
+    result: list[dict] = []
+    for p in list(by_doi.values()) + [p for p in by_title.values() if id(p) not in {id(x) for x in by_doi.values()}]:
+        if id(p) not in seen:
+            seen.add(id(p))
+            result.append(p)
     return result
 
 
