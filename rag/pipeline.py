@@ -7,11 +7,12 @@ import logging
 from vectorstore.qdrant_store import get_store
 from core.llm import llm_call
 from prompts.templates import PDF_CHAT_SYSTEM, PROPERTY_EXTRACT
+from models.schemas import ChatMessage
 
 logger = logging.getLogger(__name__)
 
-# In-memory chat history per session
-_chat_history: dict[str, list[dict]] = {}
+# In-memory chat history per session (keyed by session_id)
+_chat_history: dict[str, list[ChatMessage]] = {}
 
 
 def _chunk_text(text: str, chunk_size: int = 400, overlap: int = 80) -> list[str]:
@@ -67,7 +68,8 @@ async def chat_with_pdf(session_id: str, question: str) -> dict:
         return {
             "answer":  "No relevant content found for your question in this PDF.",
             "sources": [],
-            "history": _chat_history[session_id],
+            # BUG FIX: return list of dicts matching ChatMessage schema
+            "history": [m.model_dump() for m in _chat_history[session_id]],
         }
 
     # Build context from retrieved chunks (sorted by score)
@@ -80,7 +82,8 @@ async def chat_with_pdf(session_id: str, question: str) -> dict:
 
     system   = PDF_CHAT_SYSTEM.format(context=context)
     history  = _chat_history[session_id]
-    messages = history + [{"role": "user", "content": question}]
+    # BUG FIX: convert ChatMessage objects to dicts for the LLM messages list
+    messages = [m.model_dump() for m in history] + [{"role": "user", "content": question}]
 
     answer = await llm_call(
         system=system,
@@ -89,10 +92,15 @@ async def chat_with_pdf(session_id: str, question: str) -> dict:
         task="pdf_chat",   # routes to Claude
     )
 
-    _chat_history[session_id].append({"role": "user",      "content": question})
-    _chat_history[session_id].append({"role": "assistant", "content": answer})
+    # BUG FIX: store as ChatMessage objects so Pydantic validation succeeds in ChatResponse
+    _chat_history[session_id].append(ChatMessage(role="user",      content=question))
+    _chat_history[session_id].append(ChatMessage(role="assistant", content=answer))
 
-    return {"answer": answer, "sources": sources, "history": _chat_history[session_id]}
+    return {
+        "answer":  answer,
+        "sources": sources,
+        "history": [m.model_dump() for m in _chat_history[session_id]],
+    }
 
 
 async def extract_properties(session_id: str) -> list[dict]:
