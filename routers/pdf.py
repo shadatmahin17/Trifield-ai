@@ -1,20 +1,34 @@
 import time
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 from rag.pipeline import ingest_pdf, chat_with_pdf, extract_properties
 from analytics.tracker import get_tracker
 from models.schemas import ChatRequest, ChatResponse, PropertyExtractionResponse
+from core.config import get_settings
 
 router = APIRouter()
 
+MAX_PDF_BYTES = get_settings().max_pdf_size_mb * 1024 * 1024
+
 
 @router.post("/upload")
-async def upload(file: UploadFile = File(...)):
+async def upload(request: Request, file: UploadFile = File(...)):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are supported.")
+
+    # BUG FIX: check Content-Length header BEFORE reading the entire file into memory
+    # to avoid OOM on large uploads.
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_PDF_BYTES:
+        raise HTTPException(
+            400,
+            f"File too large ({int(content_length) / (1024*1024):.1f}MB). Max is {get_settings().max_pdf_size_mb}MB."
+        )
+
     contents = await file.read()
     size_mb  = len(contents) / (1024 * 1024)
-    if size_mb > 20:
-        raise HTTPException(400, f"File too large ({size_mb:.1f}MB). Max is 20MB.")
+    if size_mb > get_settings().max_pdf_size_mb:
+        raise HTTPException(400, f"File too large ({size_mb:.1f}MB). Max is {get_settings().max_pdf_size_mb}MB.")
+
     t0 = time.time()
     try:
         session_id = await ingest_pdf(contents, file.filename)

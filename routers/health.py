@@ -9,7 +9,19 @@ async def health():
     s = get_settings()
     has_anthropic = bool(s.anthropic_api_key)
     has_groq      = bool(s.groq_api_key)
-    has_qdrant    = bool(s.qdrant_url) or True   # local always available
+
+    # BUG FIX: was `bool(s.qdrant_url) or True` — always True regardless of config.
+    has_qdrant_cloud = bool(s.qdrant_url and s.qdrant_api_key)
+
+    # Probe local/cloud Qdrant liveness
+    qdrant_status = "unchecked"
+    try:
+        from vectorstore.qdrant_store import get_store
+        get_store()._client_().get_collections()
+        qdrant_status = "reachable"
+    except Exception as e:
+        qdrant_status = f"unreachable: {e}"
+
     return {
         "status":      "healthy",
         "timestamp":   datetime.utcnow().isoformat(),
@@ -24,8 +36,8 @@ async def health():
             "groq_key":       "set" if has_groq else "missing",
         },
         "vector_db": {
-            "engine":  "Qdrant Cloud" if s.qdrant_url else "Qdrant Local",
-            "status":  "configured",
+            "engine":  "Qdrant Cloud" if has_qdrant_cloud else "Qdrant Local",
+            "status":  qdrant_status,
         },
         "features": {
             "search":          "OpenAlex + Crossref + arXiv + PubMed + Unpaywall",
