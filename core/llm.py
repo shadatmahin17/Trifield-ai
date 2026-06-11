@@ -44,12 +44,13 @@ def _should_fallback(error: Exception) -> bool:
 
 
 async def _call_anthropic(system: str, messages: list, max_tokens: int) -> str:
+    # BUG FIX: use AsyncAnthropic so we don't block the event loop
     import anthropic
     s = get_settings()
     if not s.anthropic_api_key:
         raise ValueError("ANTHROPIC_API_KEY not set")
-    client = anthropic.Anthropic(api_key=s.anthropic_api_key)
-    r = client.messages.create(
+    client = anthropic.AsyncAnthropic(api_key=s.anthropic_api_key)
+    r = await client.messages.create(
         model=CLAUDE_MODEL, max_tokens=max_tokens,
         system=system, messages=messages,
     )
