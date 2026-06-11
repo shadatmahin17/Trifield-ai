@@ -432,7 +432,7 @@ async def search_papers(
         # Quality scoring
         query_terms = rewrite.get("primary_keywords", query.lower().split())
         entities    = rewrite.get("primary_keywords", [])
-        ranked      = rank_papers(merged, query_terms, entities)
+        ranked      = rank_papers(merged, query_terms, entities, effective_discipline)
 
         # Enrich top candidates
         candidates = ranked[:limit * 2]
@@ -443,7 +443,7 @@ async def search_papers(
         final = [r if isinstance(r, dict) else o for o, r in zip(candidates, enriched)]
 
         # Re-score after enrichment (abstracts now available)
-        final_ranked = rank_papers(final, query_terms, entities)
+        final_ranked = rank_papers(final, query_terms, entities, effective_discipline)
         top = final_ranked[:limit]
 
     papers = []
